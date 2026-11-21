@@ -1,6 +1,6 @@
 export * as SubagentTool from "./subagent.js"
 
-import { ToolFailure } from "@opencode/ai/effect"
+import { Message, ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Effect, Predicate, Schema } from "effect"
@@ -10,11 +10,26 @@ import { Job } from "../../job.js"
 import { Model } from "../../model.js"
 import { Permission } from "../../permission.js"
 import { Session } from "../../session.js"
+import { SessionBackground } from "../../session/background.js"
 import { SessionSchema } from "../../session/schema.js"
 import { SubagentDepth } from "../../session/subagent-depth.js"
 import { SubagentJob } from "../../session/subagent-job.js"
 
 export const name = "subagent"
+
+type RunningSubagent = Extract<SessionBackground.OutstandingItem, { kind: "subagent" }>
+
+/** Reminds the parent, on every step, which of its own subagents have not reported a result yet. */
+export const runningReminder = (running: ReadonlyArray<RunningSubagent>) =>
+  [
+    "<system-reminder>",
+    "These subagents are still running. Their results are not in your context yet:",
+    ...running.map(
+      (item) => `- ${item.agent} (sessionID: ${item.childSessionID}): ${item.description.replace(/\s+/g, " ").trim()}`,
+    ),
+    "Do not commit, merge, or report completion of work that depends on them. Each report starts your next turn. If no independent work is left, say what you are waiting for and end your response.",
+    "</system-reminder>",
+  ].join("\n")
 
 const backgroundResult = (sessionID: SessionSchema.ID) => ({
   sessionID,
@@ -265,5 +280,23 @@ export const Plugin = {
     yield* ctx.session.hook("context", hook)
     yield* ctx.session.hook("compaction", hook)
     yield* ctx.session.hook("generate", hook)
+
+    // Ending the turn is how a parent waits for a background subagent, so without this the model cannot tell a
+    // pending result from a finished task when it decides to commit or report completion. Grandchildren report to
+    // their own parent, so only this Session's children are listed. The reminder is not persisted.
+    yield* ctx.session.hook("context", (event) =>
+      Effect.gen(function* () {
+        const running = (yield* SessionBackground.outstanding(
+          jobs,
+          { get: (sessionID) => sessions.get(sessionID).pipe(Effect.orElseSucceed(() => undefined)) },
+          event.sessionID,
+          yield* sessions.active,
+        )).filter((item): item is RunningSubagent => item.kind === "subagent" && item.sessionID === event.sessionID)
+        if (running.length === 0) return
+        // Before the user's prompt, matching where the goal and Plan mode reminders land.
+        const at = event.messages.at(-1)?.role === "user" ? event.messages.length - 1 : event.messages.length
+        event.messages.splice(at, 0, Message.user(runningReminder(running)))
+      }),
+    )
   }),
 }

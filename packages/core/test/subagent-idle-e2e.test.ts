@@ -58,7 +58,11 @@ const pluginSupervisor = makeLocationNode({
   layer: Layer.effectDiscard(
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service
-      yield* registerToolPlugin(SubagentTool.Plugin, {}, (name, callback) => hooks.register("tool", name, callback))
+      yield* registerToolPlugin(
+        SubagentTool.Plugin,
+        { session: { hook: (name, callback) => hooks.register("session", name, callback) } },
+        (name, callback) => hooks.register("tool", name, callback),
+      )
       yield* registerToolPlugin(ShellTool.Plugin)
     }),
   ),
@@ -403,6 +407,83 @@ describe("Code Mode session jobs", () => {
 })
 
 describe("subagent idle reports end to end", () => {
+  e2e.live(
+    "reminds the parent of a running subagent until its report arrives",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* harness({ config: { permissions: [{ action: "*", resource: "*", effect: "allow" }] } })
+        const release = path.join(h.dir.path, "release")
+        const command =
+          process.platform === "win32"
+            ? `while (!(Test-Path -LiteralPath '${release}')) { Start-Sleep -Milliseconds 25 }; Write-Output done`
+            : `while [ ! -e '${release}' ]; do sleep 0.025; done; printf done`
+        yield* h.llm.serve(
+          script({
+            build: [
+              TestLLM.toolCall("call-child", SubagentTool.name, {
+                agent: "reviewer",
+                description: "regression test",
+                prompt: "Write the regression test and run it.",
+              }),
+              TestLLM.text("Waiting for the regression test", "parent-wait"),
+              TestLLM.text("Reviewed the report", "parent-review"),
+            ],
+            reviewer: [
+              TestLLM.toolCall("call-child-shell", ShellTool.name, { command }),
+              TestLLM.text("Regression test passes", "child-done"),
+            ],
+          }),
+        )
+        const reminders = Effect.map(h.llm.requests(), (requests) =>
+          requests
+            .filter((request) => request.model.id === "build")
+            .map((request) =>
+              request.messages.flatMap((message) =>
+                message.role === "user"
+                  ? message.content.flatMap((part) =>
+                      part.type === "text" && part.text.startsWith("<system-reminder>") ? [part.text] : [],
+                    )
+                  : [],
+              ),
+            ),
+        )
+
+        yield* h.sessions.prompt({ sessionID: h.parent.id, text: "Finish the change" })
+        yield* h.sessions.wait(h.parent.id)
+        const children = (yield* h.jobs.runningBackground).flatMap((item) =>
+          item.kind === "subagent" ? [item.childSessionID] : [],
+        )
+        expect(children).toHaveLength(1)
+        const waiting = yield* reminders
+        expect(waiting).toHaveLength(2)
+        // The step that launches the child runs before it exists; the next step lists it.
+        expect(waiting[0]).toEqual([])
+        expect(waiting[1]).toHaveLength(1)
+        expect(waiting[1]![0]).toContain(`- reviewer (sessionID: ${children[0]}): regression test`)
+        expect(waiting[1]).toEqual([
+          SubagentTool.runningReminder([
+            {
+              kind: "subagent",
+              sessionID: h.parent.id,
+              childSessionID: children[0]!,
+              agent: "reviewer",
+              description: "regression test",
+            },
+          ]),
+        ])
+
+        yield* Effect.promise(() => Bun.write(release, "go"))
+        yield* waitForReports(h, h.parent.id, 1)
+        yield* h.sessions.wait(h.parent.id)
+        const reported = yield* reminders
+        expect(reported).toHaveLength(3)
+        // The report-triggered turn sees the result instead of the reminder.
+        expect(reported[2]).toEqual([])
+        expect(yield* h.jobs.pendingBackground).toEqual([])
+      }),
+    30_000,
+  )
+
   e2e.live(
     "reports immediately with running background work and again after the shell exits",
     () =>
