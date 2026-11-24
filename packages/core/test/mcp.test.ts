@@ -108,6 +108,29 @@ type ResourceTemplatePage = {
   nextCursor?: string
 }
 
+// Passes a `subscriptions/listen` SSE response through until its acknowledgement event, then ends it.
+function endAfterAcknowledgement(response: Response) {
+  if (!response.body) return response
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let seen = ""
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const chunk = await reader.read()
+      if (!chunk.done) {
+        controller.enqueue(chunk.value)
+        seen += decoder.decode(chunk.value, { stream: true })
+      }
+      const ack = seen.indexOf("notifications/subscriptions/acknowledged")
+      if (chunk.done || (ack !== -1 && /\r?\n\r?\n/.test(seen.slice(ack)))) {
+        void reader.cancel().catch(() => {})
+        controller.close()
+      }
+    },
+  })
+  return new Response(body, { status: response.status, headers: response.headers })
+}
+
 function resourceServer(
   input: {
     /** Serve 2026-07-28 only through createMcpHandler; the default is a sessionful legacy transport. */
@@ -133,6 +156,11 @@ function resourceServer(
     roots?: boolean
     /** Advertises MCP Events; answer its requests through `respond`. */
     events?: boolean
+    /**
+     * 2026-07-28 only: ends this many `subscriptions/listen` streams right after acknowledging them, as a redeploy,
+     * a proxy timeout or a network drop would.
+     */
+    endListens?: number
     respond?: (request: Request) => Response | undefined | Promise<Response | undefined>
   } = {},
 ) {
@@ -164,7 +192,9 @@ function resourceServer(
         extraTools: [] as ListToolsResult["tools"],
         urls: [] as string[],
         sessions: [] as string[],
+        listens: 0,
       }
+      let endListens = input.endListens ?? 0
       // One Server speaks one session, so a restart is a fresh Server and transport. Requests that
       // still carry the previous session id are then unknown to the new transport.
       const server = () => {
@@ -331,7 +361,13 @@ function resourceServer(
           if (typeof body === "object" && body !== null && "method" in body && body.method === "initialize") {
             state.initializations += 1
           }
-          return (await input.respond?.(request)) ?? modern?.fetch(request) ?? current.transport.handleRequest(request)
+          const listen = isRecord(body) && body.method === "subscriptions/listen"
+          if (listen) state.listens += 1
+          const response =
+            (await input.respond?.(request)) ?? modern?.fetch(request) ?? current.transport.handleRequest(request)
+          if (!listen || endListens === 0) return response
+          endListens -= 1
+          return endAfterAcknowledgement(await response)
         },
       })
       return {
@@ -1421,6 +1457,39 @@ test("retries a modern MCP tool call whose listed header declaration went stale"
         // The stale Region header is rejected once; the relisted definition then sends Zone.
         expect(rejected).toEqual(["eu"])
         expect(server.state.toolLists).toBe(2)
+      }),
+    ),
+  )
+})
+
+test("reopens a modern list change stream the server ends and catches up on missed changes", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer({ modern: true, listChanged: true, endListens: 1 })
+        yield* Effect.gen(function* () {
+          const service = yield* Mcp.Service
+          yield* settled(service)
+          const names = service.tools().pipe(Effect.map((tools) => tools.map((tool) => tool.name)))
+          const until = (name: string) =>
+            names.pipe(
+              Effect.filterOrFail((list) => list.includes(name)),
+              Effect.retry({ times: 200, schedule: Schedule.spaced("25 millis") }),
+            )
+          expect(yield* names).toEqual(["echo"])
+
+          // Changed while the stream is down, so no notification reaches the client.
+          server.state.extraTools.push({ name: "missed", inputSchema: { type: "object", properties: {} } })
+          yield* until("missed")
+          expect(server.state.listens).toBe(2)
+
+          server.state.extraTools.push({ name: "added", inputSchema: { type: "object", properties: {} } })
+          yield* Effect.promise(server.sendToolListChanged)
+          expect(yield* until("added")).toEqual(["added", "echo", "missed"])
+          expect((yield* service.servers()).find((entry) => entry.name === "resources")?.status).toEqual({
+            status: "connected",
+          })
+        }).pipe(Effect.provide(resourceMcpLayer(server.url)))
       }),
     ),
   )

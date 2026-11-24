@@ -930,6 +930,54 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
         changed.resources = callback
       },
     }
+    // On 2026-07-28 tool, prompt and resource list changes arrive on the `subscriptions/listen` stream the SDK opens
+    // at connect, and the SDK never opens it again. Held for the connection's life like the events listener below: a
+    // stream the server ends or drops, or one that failed to open at connect, is reopened after a capped, jittered
+    // delay. Each reopen reports every list as changed, to catch changes missed while it was closed. A refusal is not
+    // retried.
+    const capabilities = client.getServerCapabilities()
+    const lists = (["tools", "prompts", "resources"] as const).filter(
+      (kind) => capabilities?.[kind]?.listChanged === true,
+    )
+    if (connection.modern && lists.length > 0) {
+      const filter = Object.fromEntries(lists.map((kind) => [`${kind}ListChanged`, true]))
+      const ended = (subscription: { readonly closed: Promise<unknown> }) =>
+        Effect.promise(() => subscription.closed).pipe(
+          Effect.andThen(Effect.fail(new Error("the server closed the list change stream"))),
+        )
+      const relisten = Effect.acquireRelease(
+        Effect.tryPromise({
+          try: (signal) => client.listen(filter, { timeout: catalog.timeout, signal }),
+          catch: (error) => error,
+        }),
+        (subscription) => Effect.sync(() => void subscription.close().catch(() => {})),
+        // Opening waits for the server's ack; without this, closing the connection would wait for it too.
+        { interruptible: true },
+      ).pipe(
+        Effect.tap(() => Effect.sync(() => lists.forEach((kind) => changed[kind]()))),
+        Effect.flatMap(ended),
+        Effect.scoped,
+      )
+      // The first attempt watches the stream the SDK opened at connect; later attempts open their own.
+      let opened = client.autoOpenedSubscription
+      yield* Effect.suspend(() => {
+        const subscription = opened
+        opened = undefined
+        return subscription ? ended(subscription) : relisten
+      }).pipe(
+        Effect.tapError((error) =>
+          Effect.logWarning("MCP list change listener stopped", { server, error: describe(error) }),
+        ),
+        Effect.retry(
+          reopen.pipe(
+            Schedule.setInputType<unknown>(),
+            Schedule.while(({ input }) => !(input instanceof ProtocolError)),
+          ),
+        ),
+        Effect.ignore,
+        Effect.forkScoped,
+      )
+    }
     // A server whose event types change at runtime says so on a `subscriptions/listen` stream; relisting keeps each
     // type's mirrored headers current. Open streams keep running.
     const settings = client.getServerCapabilities()?.extensions?.[EVENTS]
