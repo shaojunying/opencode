@@ -1257,6 +1257,63 @@ test("reconnects and retries a tool call after the MCP session expires", async (
   )
 })
 
+// Servers that answer a session they no longer know with 400 instead of 404.
+describe.each([
+  [
+    "a restarted single-session server",
+    () =>
+      Response.json(
+        { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: Server not initialized" }, id: null },
+        { status: 400 },
+      ),
+  ],
+  [
+    "a TypeScript SDK example server",
+    () =>
+      Response.json(
+        { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null },
+        { status: 400 },
+      ),
+  ],
+  [
+    "an older Python SDK session manager",
+    () => new Response("Bad Request: No valid session ID provided", { status: 400 }),
+  ],
+] as const)("reconnects after %s answers the expired session with 400", (_, expired) => {
+  test("and retries the tool call", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const stale: { session?: string } = {}
+          const server = yield* resourceServer({
+            respond: (request) =>
+              stale.session !== undefined && request.headers.get("mcp-session-id") === stale.session
+                ? expired()
+                : undefined,
+          })
+          yield* Effect.gen(function* () {
+            const service = yield* Mcp.Service
+            yield* service.callTool({ server: "resources", name: "echo", args: { n: 1 } })
+            expect(server.state.sessions).toHaveLength(1)
+
+            // The restarted server does not know the client's session and answers it with 400.
+            stale.session = server.state.sessions[0]
+            yield* Effect.promise(server.restart)
+            const result = yield* service.callTool({ server: "resources", name: "echo", args: { n: 2 } })
+
+            expect(result.isError).toBe(false)
+            expect(server.state.toolCalls.map((call) => call.arguments)).toEqual([{ n: 1 }, { n: 2 }])
+            expect(server.state.initializations).toBe(2)
+            expect((yield* service.servers()).find((entry) => entry.name === "resources")?.status).toEqual({
+              status: "connected",
+            })
+          }).pipe(Effect.provide(resourceMcpLayer(server.url)))
+        }),
+      ),
+    )
+  })
+})
+
 describe.each([
   ["legacy", undefined],
   ["modern", "2026-07-28"],

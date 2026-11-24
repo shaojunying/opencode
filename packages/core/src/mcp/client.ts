@@ -488,9 +488,10 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
   })
 
   // Legacy era only: the transport holds the Mcp-Session-Id the server minted, and the server answering
-  // it with 404, or with the 400 a freshly restarted single-session server emits, means it no longer
-  // knows this connection. Modern connections never carry a session id, so a modern 404 for an unknown
-  // method is not mistaken for expiry. Other 400s pass through untouched.
+  // it with 404, with the 400 a freshly restarted single-session server emits, or with the 400 that older
+  // Python SDK session managers and the TypeScript SDK examples send for an unknown session, means it no
+  // longer knows this connection. Modern connections never carry a session id, so a modern 404 for an
+  // unknown method is not mistaken for expiry. Other 400s pass through untouched.
   const session: { transport?: StreamableHTTPClientTransport; expired?: () => void; reported: boolean } = {
     reported: false,
   }
@@ -502,7 +503,8 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
       error.status === 404 ||
       (error.status === 400 &&
         typeof error.data.text === "string" &&
-        error.data.text.includes("Bad Request: Server not initialized"))
+        (error.data.text.includes("Bad Request: Server not initialized") ||
+          error.data.text.includes("Bad Request: No valid session ID provided")))
     if (!expired) return new Error(explain(error))
     if (!session.reported) {
       session.reported = true
