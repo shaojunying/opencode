@@ -1495,6 +1495,63 @@ test("reopens a modern list change stream the server ends and catches up on miss
   )
 })
 
+test("spaces out reopens of a list change stream the server keeps ending", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer({ modern: true, listChanged: true, endListens: Infinity })
+        yield* Effect.gen(function* () {
+          const service = yield* Mcp.Service
+          yield* settled(service)
+          const lists = server.state.toolLists
+          // The backoff starts near a second and doubles, so 3.5 seconds hold at most three reopens.
+          yield* Effect.sleep("3500 millis")
+          expect(server.state.listens).toBeGreaterThanOrEqual(2)
+          expect(server.state.listens).toBeLessThanOrEqual(4)
+          expect(server.state.toolLists - lists).toBeLessThanOrEqual(3)
+        }).pipe(Effect.provide(resourceMcpLayer(server.url)))
+      }),
+    ),
+  )
+})
+
+test("opens the list change stream itself when it failed to open at connect", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        let refused = false
+        const server = yield* resourceServer({
+          modern: true,
+          listChanged: true,
+          respond: async (request) => {
+            if (refused || request.method !== "POST") return undefined
+            const body: unknown = await request.clone().json()
+            if (!isRecord(body) || body.method !== "subscriptions/listen") return undefined
+            refused = true
+            return new Response("Service Unavailable", { status: 503 })
+          },
+        })
+        yield* Effect.gen(function* () {
+          const service = yield* Mcp.Service
+          yield* settled(service)
+          yield* Effect.sync(() => server.state.listens).pipe(
+            Effect.filterOrFail((listens) => listens >= 2),
+            Effect.retry({ times: 200, schedule: Schedule.spaced("25 millis") }),
+          )
+          server.state.extraTools.push({ name: "added", inputSchema: { type: "object", properties: {} } })
+          yield* Effect.promise(server.sendToolListChanged)
+          const names = yield* service.tools().pipe(
+            Effect.map((tools) => tools.map((tool) => tool.name)),
+            Effect.filterOrFail((names) => names.includes("added")),
+            Effect.retry({ times: 200, schedule: Schedule.spaced("25 millis") }),
+          )
+          expect(names).toEqual(["added", "echo"])
+        }).pipe(Effect.provide(resourceMcpLayer(server.url)))
+      }),
+    ),
+  )
+})
+
 test("lists, reads, and reports MCP resource changes", async () => {
   await Effect.runPromise(
     Effect.scoped(
